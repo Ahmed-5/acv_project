@@ -1,0 +1,34 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+# ──────────────────────────────────────────────────────────────────────────────
+# DoGDepthNet — Python 3.11 requirements
+# Install: pip install -r requirements.txt
+# For CUDA 12.1: pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Core deep learning ────────────────────────────────────────────────────────
+torch==2.3.1
+torchvision==0.18.1
+
+# ── Numerical computing ───────────────────────────────────────────────────────
+numpy==1.26.4               # 2.x avoided — torchvision 0.18 has breaking issues
+scipy==1.13.1               # sparse.csr_matrix + spsolve for fill_depth_colorization
+
+# ── Computer vision ───────────────────────────────────────────────────────────
+opencv-contrib-python==4.9.0.80   # cv2.undistort + cv2.ximgproc.jointBilateralFilter
+Pillow==10.3.0              # PIL.Image — raw .pgm/.ppm loading, HF dataset images
+
+# ── Dataset loading ───────────────────────────────────────────────────────────
+datasets==2.19.2            # HuggingFace sayakpaul/nyu_depth_v2 (mode='hf')
+huggingface_hub==0.23.2     # required by datasets
+h5py==3.11.0                # nyu_depth_v2_labeled.mat loading (mode='mat')
+
+# ── Training utilities ────────────────────────────────────────────────────────
+tqdm==4.66.4                # progress bars in training loop
+wandb==0.17.0               # experiment tracking (optional — remove if unused)
+tensorboard==2.17.0         # TensorBoard alternative to W&B
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib==3.9.0           # depth map visualisation, loss curves
+
+# ── Serialisation / misc ──────────────────────────────────────────────────────
+PyYAML==6.0.1               # config files
