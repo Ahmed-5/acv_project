@@ -6,12 +6,17 @@ NYU Depth V2 dataset — three loading modes:
 """
 import os
 import re
-import numpy as np
+import io
 import torch
+import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
+import pyarrow.parquet as pq
+import pyarrow as pa
+import h5py
+import glob
 
 from data.nyu_toolbox import (
     project_depth_map, crop_image,
@@ -37,6 +42,98 @@ def _img_transform(img_size):
         transforms.ToTensor(),
         transforms.Normalize(mean=NYU_MEAN, std=NYU_STD),
     ])
+
+
+
+class NYUParquet(Dataset):
+    """
+    Loads NYU Depth V2 from locally downloaded HuggingFace Parquet shards.
+
+    Each row contains:
+        'image'     : {'bytes': ..., 'path': ...}  — uint8 RGB JPEG
+        'depth_map' : {'bytes': ..., 'path': ...}  — uint8 or uint16 PNG
+
+    Args:
+        parquet_paths : list of .parquet file paths (all train shards, or val)
+        img_size      : (H, W) tuple for output tensors
+        augment       : apply random flip/crop/jitter (True for train only)
+    """
+
+    def __init__(self, parquet_paths: list, img_size=(256, 320), augment=False):
+        tables      = [pq.read_table(p) for p in parquet_paths]
+        self.df     = pa.concat_tables(tables).to_pandas()
+        self.tf     = _img_transform(img_size)
+        self.h, self.w = img_size
+        self.augment = augment
+
+        # Auto-detect depth scale from first row
+        sample_depth = np.array(
+            Image.open(io.BytesIO(self.df.iloc[0]['depth_map']['bytes']))
+        )
+        if sample_depth.dtype == np.uint8:
+            self.depth_scale = 255.0 / MAX_DEPTH    # uint8  → metres
+        else:
+            self.depth_scale = 65535.0 / MAX_DEPTH  # uint16 → metres
+
+        print(f"NYUParquet: {len(self.df)} samples | "
+              f"depth dtype={sample_depth.dtype} | "
+              f"augment={augment}")
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # ── Load RGB ──────────────────────────────────────────────────────────
+        image = Image.open(
+            io.BytesIO(row['image']['bytes'])
+        ).convert('RGB')
+
+        # ── Load depth ────────────────────────────────────────────────────────
+        depth_raw = np.array(
+            Image.open(io.BytesIO(row['depth_map']['bytes']))
+        ).astype(np.float32)
+        depth_m = depth_raw / self.depth_scale   # → metres
+
+        # ── Augmentation (train only) ─────────────────────────────────────────
+        if self.augment:
+            import torchvision.transforms.functional as TF
+            import random
+
+            # Random horizontal flip
+            if random.random() > 0.5:
+                image   = TF.hflip(image)
+                depth_m = depth_m[:, ::-1].copy()
+
+            # Random crop ±15 %
+            w, h      = image.size
+            crop_frac = random.uniform(0.85, 1.0)
+            ch, cw    = int(h * crop_frac), int(w * crop_frac)
+            top       = random.randint(0, h - ch)
+            left      = random.randint(0, w - cw)
+            image     = TF.crop(image, top, left, ch, cw)
+            depth_m   = depth_m[top:top + ch, left:left + cw]
+
+            # Color jitter on RGB only
+            image = transforms.ColorJitter(
+                brightness=0.3, contrast=0.3,
+                saturation=0.2, hue=0.05
+            )(image)
+
+            # Random rotation ±5°
+            if random.random() > 0.7:
+                angle   = random.uniform(-5, 5)
+                image   = TF.rotate(image, angle)
+                depth_t = torch.from_numpy(depth_m).unsqueeze(0)
+                depth_m = TF.rotate(depth_t, angle).squeeze(0).numpy()
+
+        # ── Tensorise ─────────────────────────────────────────────────────────
+        image = self.tf(image)
+        depth = _resize_depth(depth_m, self.h, self.w).clamp(0, MAX_DEPTH)
+        mask  = (depth > 0) & (depth <= MAX_DEPTH)
+
+        return {'image': image, 'depth': depth, 'mask': mask}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,6 +339,107 @@ class NYURawScenes(Dataset):
         depth = _resize_depth(depth_cropped, self.h, self.w).clamp(0, MAX_DEPTH)
         mask  = (depth > 0) & (depth <= MAX_DEPTH)
         return {'image': image, 'depth': depth, 'mask': mask}
+    
+
+class NYUDepthH5(Dataset):
+    """
+    Load NYU Depth V2 from .h5 files organised by scene directory.
+
+    Expected layout (matches your download):
+        root/
+          train/{scene_name}/*.h5
+          val/official/*.h5
+
+    Args:
+        h5_dir       : path to train/ or val/official/
+        img_size     : (H, W) output size
+        augment      : random flip/crop/jitter (True for train only)
+        scene_filter : optional list of scene type strings to keep,
+                       e.g. ['bedroom', 'kitchen'] — uses get_scene_type()
+    """
+
+    def __init__(self, h5_dir: str, img_size=(256, 320),
+                 augment=False, scene_filter=None):
+        all_files = sorted(glob.glob(
+            os.path.join(h5_dir, '**', '*.h5'), recursive=True
+        ))
+        assert all_files, f"No .h5 files found under {h5_dir}"
+
+        # Build (filepath, scene_name) pairs from directory name
+        self.samples = [
+            (fp, os.path.basename(os.path.dirname(fp)))
+            for fp in all_files
+        ]
+
+        # Optional scene-type filter (uses get_scene_type from nyu_toolbox)
+        if scene_filter is not None:
+            from data.nyu_toolbox import get_scene_type
+            self.samples = [
+                (fp, scene) for fp, scene in self.samples
+                if get_scene_type(scene) in scene_filter
+            ]
+            assert self.samples, \
+                f"scene_filter={scene_filter} matched no scenes in {h5_dir}"
+
+        self.tf        = _img_transform(img_size)
+        self.h, self.w = img_size
+        self.augment   = augment
+
+        # Collect unique scene types for reporting
+        if scene_filter is None:
+            from data.nyu_toolbox import get_scene_type
+        scene_types = sorted({get_scene_type(s) for _, s in self.samples})
+        print(f"NYUDepthH5 : {len(self.samples)} samples | "
+              f"{len(scene_types)} scene types | augment={augment}")
+        print(f"  scenes   : {', '.join(scene_types)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        filepath, scene_name = self.samples[idx]
+
+        with h5py.File(filepath, 'r') as f:
+            rgb     = np.transpose(np.array(f['rgb']),   (1, 2, 0)).astype(np.uint8)
+            depth_m = np.array(f['depth'], dtype=np.float32)  # already metres
+
+        image = Image.fromarray(rgb)
+
+        # ── Augmentation (train only) ─────────────────────────────────────────
+        if self.augment:
+            import torchvision.transforms.functional as TF
+            import random
+
+            if random.random() > 0.5:
+                image   = TF.hflip(image)
+                depth_m = depth_m[:, ::-1].copy()
+
+            w, h      = image.size
+            crop_frac = random.uniform(0.85, 1.0)
+            ch, cw    = int(h * crop_frac), int(w * crop_frac)
+            top       = random.randint(0, h - ch)
+            left      = random.randint(0, w - cw)
+            image     = TF.crop(image, top, left, ch, cw)
+            depth_m   = depth_m[top:top + ch, left:left + cw]
+
+            image = transforms.ColorJitter(
+                brightness=0.3, contrast=0.3,
+                saturation=0.2, hue=0.05
+            )(image)
+
+            if random.random() > 0.7:
+                angle   = random.uniform(-5, 5)
+                image   = TF.rotate(image, angle)
+                depth_m = TF.rotate(
+                    torch.from_numpy(depth_m).unsqueeze(0), angle
+                ).squeeze(0).numpy()
+
+        image = self.tf(image)
+        depth = _resize_depth(depth_m, self.h, self.w).clamp(0, MAX_DEPTH)
+        mask  = (depth > 0) & (depth <= MAX_DEPTH)
+
+        return {'image': image, 'depth': depth, 'mask': mask,
+                'scene': scene_name}   # ← free metadata for analysis
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,24 +448,30 @@ class NYURawScenes(Dataset):
 def build_loaders(mode='mat',
                   mat_path=None,
                   raw_root=None,
+                  parquet_train=None,    # ← new
+                  parquet_val=None,      # ← new
+                  h5_train_dir=None,    # ← new
+                  h5_val_dir=None,      # ← new
                   img_size=(256, 320),
                   batch_size=8,
                   num_workers=4,
                   apply_crop=True):
-    """
-    mode:
-      'hf'  — HuggingFace (no local files needed)
-      'mat' — nyu_depth_v2_labeled.mat  (recommended)
-      'raw' — raw scene directories
-    """
-    if mode == 'hf':
-        train_ds = NYUHuggingFace('train',      img_size)
-        val_ds   = NYUHuggingFace('validation', img_size)
 
-    elif mode == 'mat':
+    if mode == 'mat':
         assert mat_path, "Provide mat_path= for mode='mat'"
         train_ds = NYUMatFile(mat_path, 'train', img_size, apply_crop)
         val_ds   = NYUMatFile(mat_path, 'test',  img_size, apply_crop)
+
+    elif mode == 'parquet':
+        assert parquet_train and parquet_val, \
+            "Provide parquet_train= and parquet_val= for mode='parquet'"
+        train_ds = NYUParquet(parquet_train, img_size, augment=True)
+        val_ds   = NYUParquet(parquet_val,   img_size, augment=False)
+
+    elif mode == 'h5':
+        assert h5_train_dir and h5_val_dir
+        train_ds = NYUDepthH5(h5_train_dir, img_size, augment=True)
+        val_ds   = NYUDepthH5(h5_val_dir,   img_size, augment=False)
 
     elif mode == 'raw':
         assert raw_root, "Provide raw_root= for mode='raw'"
@@ -277,7 +481,7 @@ def build_loaders(mode='mat',
             all_ds, [len(all_ds) - n_val, n_val]
         )
     else:
-        raise ValueError(f"Unknown mode: {mode}")
+        raise ValueError(f"Unknown mode: {mode!r}. Choose 'mat', 'parquet', or 'raw'.")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=True,

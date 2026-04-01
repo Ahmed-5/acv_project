@@ -8,6 +8,8 @@ from models.dog_depth_net import DoGDepthNet
 from losses.dog_losses    import DoGDepthLoss
 from data.nyu_dataset     import build_loaders   # <-- new
 
+from tqdm import tqdm
+
 import time
 
 
@@ -33,7 +35,7 @@ def train_one_epoch(student, teacher, loader, optimizer, criterion, device):
     student.train();  teacher.eval()
     totals = {k: 0.0 for k in ['total','si','distill','consistency','edge']}
 
-    for batch in loader:
+    for batch in tqdm(loader):
         image    = batch['image'].to(device)
         depth_gt = batch['depth'].to(device)
         mask     = batch['mask'].to(device)
@@ -103,12 +105,12 @@ if __name__ == '__main__':
     #     img_size=IMG_SIZE, batch_size=BATCH_SIZE, num_workers=4
     # )
 
-    # Mode A: labeled .mat file (recommended — fastest, no toolbox needed per sample)
-    train_loader, val_loader = build_loaders(
-        mode='mat',
-        mat_path='./dataset/nyu_depth_v2_labeled.mat',
-        img_size=IMG_SIZE, batch_size=BATCH_SIZE
-    )
+    # # Mode A: labeled .mat file (recommended — fastest, no toolbox needed per sample)
+    # train_loader, val_loader = build_loaders(
+    #     mode='mat',
+    #     mat_path='./dataset/nyu_depth_v2_labeled.mat',
+    #     img_size=IMG_SIZE, batch_size=BATCH_SIZE
+    # )
 
     # # Mode B: raw scene directories (full toolbox pipeline per sample)
     # train_loader, val_loader = build_loaders(
@@ -117,10 +119,13 @@ if __name__ == '__main__':
     #     img_size=IMG_SIZE, batch_size=BATCH_SIZE, fill_depth=True
     # )
 
-    # # Mode C: HuggingFace (no local download needed)
-    # train_loader, val_loader = build_loaders(
-    #     mode='hf', img_size=IMG_SIZE, batch_size=BATCH_SIZE
-    # )
+    # Mode C: preprocessed .h5 files (fast loading, no toolbox needed per sample)
+    train_loader, val_loader = build_loaders(
+        mode='h5',
+        h5_train_dir='./hf_dataset/data/train/',
+        h5_val_dir='./hf_dataset/data/val/',
+        img_size=IMG_SIZE, batch_size=BATCH_SIZE
+    )
 
     # ── Models ─────────────────────────────────────────────────────────
     student = build_student(device)
@@ -164,11 +169,12 @@ if __name__ == '__main__':
 
         if val_metrics['RMSE'] < best_rmse:
             best_rmse = val_metrics['RMSE']
+            best_sigmas = student.get_learned_sigmas()
             torch.save({
                 'epoch': epoch,
                 'model_state': student.state_dict(),
                 'optimizer_state': optim.state_dict(),
                 'val_metrics': val_metrics,
-                'learned_sigmas': student.get_learned_sigmas(),
+                'learned_sigmas': best_sigmas,
             }, SAVE_PATH)
-            print(f"  ✓ Saved best model (RMSE={best_rmse:.4f})")
+            print(f"  ✓ Saved best model (RMSE={best_rmse:.4f}) with sigmas {best_sigmas}")

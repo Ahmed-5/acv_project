@@ -1,0 +1,5 @@
+mkdir hf_dataset
+cd hf_dataset
+
+git lfs install
+huggingface-cli download sayakpaul/nyu_depth_v2 --repo-type dataset --local-dir .

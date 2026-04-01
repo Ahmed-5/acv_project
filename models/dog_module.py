@@ -72,3 +72,18 @@ class AdaptiveDoGModule(nn.Module):
         bmin   = bf.min(1)[0].view(B,1,1,1)
         bmax   = bf.max(1)[0].view(B,1,1,1)
         return (b - bmin) / (bmax - bmin + 1e-8)        # normalized [0,1]
+    
+    def get_learned_sigmas(self):
+        """
+        Returns current learned sigma pairs as a list of (s1, s2) tuples.
+        Converts from log-space parameters back to actual sigma values.
+        """
+        s1 = torch.exp(self.log_sigma1).detach().cpu().tolist()
+        s2 = torch.exp(self.log_sigma2).detach().cpu().tolist()
+        return [(round(a, 4), round(b, 4)) for a, b in zip(s1, s2)]
+
+    def sigma_summary(self):
+        """One-line string for logging, e.g. 'σ[(0.48,1.02) (0.99,2.11) (1.97,4.03)]'"""
+        pairs = self.get_learned_sigmas()
+        inner = ' '.join(f'({s1},{s2})' for s1, s2 in pairs)
+        return f'σ[{inner}]'
