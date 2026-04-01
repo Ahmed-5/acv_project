@@ -35,7 +35,7 @@ def train_one_epoch(student, teacher, loader, optimizer, criterion, device):
     student.train();  teacher.eval()
     totals = {k: 0.0 for k in ['total','si','distill','consistency','edge']}
 
-    for batch in tqdm(loader):
+    for batch in tqdm(loader, desc="Training", leave=False):
         image    = batch['image'].to(device)
         depth_gt = batch['depth'].to(device)
         mask     = batch['mask'].to(device)
@@ -66,7 +66,7 @@ def evaluate(student, loader, device):
     student.eval()
     abs_rels, rmses, delta1s = [], [], []
 
-    for batch in loader:
+    for batch in tqdm(loader, desc="Evaluating", leave=False):
         image    = batch['image'].to(device)
         depth_gt = batch['depth'].to(device)
         mask     = batch['mask'].squeeze(1).to(device)
