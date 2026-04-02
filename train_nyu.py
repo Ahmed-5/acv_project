@@ -94,7 +94,7 @@ if __name__ == '__main__':
     IMG_SIZE   = (256, 320)   # NYU native is 480x640; downscale for speed
     BATCH_SIZE = 8
     NUM_EPOCHS = 20
-    LR         = 1e-4
+    LR         = 1e-3
     SAVE_PATH = 'checkpoints/dog_depth_nyu.pth'
     os.makedirs('checkpoints', exist_ok=True)   # ← add this line
 
@@ -138,7 +138,8 @@ if __name__ == '__main__':
 
     optim = build_optimizer(student, lr=LR)
     crit  = DoGDepthLoss(alpha=1.0, beta=0, gamma=0.1, delta=0.1)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=NUM_EPOCHS)
+    # sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=NUM_EPOCHS)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode='min', factor=0.5, patience=3)
 
     total_p = sum(p.numel() for p in student.parameters())
     print(f"Params: {total_p/1e6:.2f}M | Device: {device}")
@@ -153,7 +154,8 @@ if __name__ == '__main__':
             student, teacher, train_loader, optim, crit, device
         )
         val_metrics = evaluate(student, val_loader, device)
-        sched.step()
+        # sched.step()
+        sched.step(val_metrics['RMSE'])  # Reduce LR if RMSE plateaus
 
         elapsed = time.time() - t0
         mins, secs = divmod(int(elapsed), 60)
