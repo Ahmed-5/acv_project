@@ -139,16 +139,6 @@ if __name__ == '__main__':
 
     optim = build_optimizer(student, lr=LR)
     crit  = DoGDepthLoss(alpha=1.0, beta=0, gamma=0.1, delta=0.1)
-    # sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=NUM_EPOCHS)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim,
-        mode      = 'min',
-        factor    = 0.5,     # halve LR, not 0.1 (too aggressive for 20 epochs)
-        patience  = 2,       # only wait 2 epochs, not default 10
-        threshold = 1e-4,    # minimum RMSE improvement to count
-        min_lr    = 1e-6,    # floor
-        verbose   = True     # prints when LR drops
-    )
 
     # code for loading from checkpoint if needed
     if os.path.exists(SAVE_PATH):
@@ -161,6 +151,16 @@ if __name__ == '__main__':
     for param_group in optim.param_groups:
         param_group['lr'] = LR
 
+    # sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=NUM_EPOCHS)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim,
+        mode      = 'min',
+        factor    = 0.5,     # halve LR, not 0.1 (too aggressive for 20 epochs)
+        patience  = 2,       # only wait 2 epochs, not default 10
+        threshold = 1e-4,    # minimum RMSE improvement to count
+        min_lr    = 1e-6,    # floor
+        verbose   = True     # prints when LR drops
+    )
     current_lr = sched.get_last_lr()[0]
     print(f"Initial LR: {current_lr:.6f}")
 
