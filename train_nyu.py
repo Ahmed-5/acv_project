@@ -154,12 +154,11 @@ if __name__ == '__main__':
     print(f"Initial LR: {current_lr:.6f}")
 
     # code for loading from checkpoint if needed
-    # if os.path.exists(SAVE_PATH):
-    #     checkpoint = torch.load(SAVE_PATH)
-    #     student.load_state_dict(checkpoint['student'])
-    #     optim.load_state_dict(checkpoint['optim'])
-    #     sched.load_state_dict(checkpoint['sched'])
-    #     print(f"Loaded checkpoint from {SAVE_PATH}")
+    if os.path.exists(SAVE_PATH):
+        checkpoint = torch.load(SAVE_PATH)
+        student.load_state_dict(checkpoint['model_state'])
+        optim.load_state_dict(checkpoint['optimizer_state'])
+        print(f"Loaded checkpoint from {SAVE_PATH}")
 
     total_p = sum(p.numel() for p in student.parameters())
     print(f"Params: {total_p/1e6:.2f}M | Device: {device}")
