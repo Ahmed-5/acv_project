@@ -27,7 +27,8 @@ def build_optimizer(model, lr=1e-4):
                    if not any(p is dp for dp in dog_params)]
     return torch.optim.AdamW([
         {'params': base_params, 'lr': lr},
-        {'params': dog_params,  'lr': lr * 0.1}
+        {'params': dog_params,  'lr': lr}
+        # {'params': dog_params,  'lr': lr * 0.1}
     ], weight_decay=1e-5)
 
 
