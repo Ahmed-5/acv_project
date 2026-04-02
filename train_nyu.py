@@ -92,9 +92,9 @@ def evaluate(student, loader, device):
 if __name__ == '__main__':
     # ── Config ─────────────────────────────────────────────────────────
     IMG_SIZE   = (256, 320)   # NYU native is 480x640; downscale for speed
-    BATCH_SIZE = 8
-    NUM_EPOCHS = 20
-    LR         = 1e-3
+    BATCH_SIZE = 128
+    NUM_EPOCHS = 30
+    LR         = 1e-4
     SAVE_PATH = 'checkpoints/dog_depth_nyu.pth'
     os.makedirs('checkpoints', exist_ok=True)   # ← add this line
 
@@ -139,7 +139,15 @@ if __name__ == '__main__':
     optim = build_optimizer(student, lr=LR)
     crit  = DoGDepthLoss(alpha=1.0, beta=0, gamma=0.1, delta=0.1)
     # sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=NUM_EPOCHS)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode='min', factor=0.5, patience=3)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim,
+        mode      = 'min',
+        factor    = 0.5,     # halve LR, not 0.1 (too aggressive for 20 epochs)
+        patience  = 2,       # only wait 2 epochs, not default 10
+        threshold = 1e-4,    # minimum RMSE improvement to count
+        min_lr    = 1e-6,    # floor
+        verbose   = True     # prints when LR drops
+    )
 
     # code for loading from checkpoint if needed
     # if os.path.exists(SAVE_PATH):
