@@ -393,27 +393,32 @@ class NYUDepthH5(Dataset):
               f"{len(scene_types)} scene types | augment={augment}")
         print(f"  scenes   : {', '.join(scene_types)}")
 
+        self._color_jitter = transforms.ColorJitter(
+            brightness=0.4, contrast=0.4,
+            saturation=0.3, hue=0.08
+        )
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         filepath, scene_name = self.samples[idx]
-
         with h5py.File(filepath, 'r') as f:
             rgb     = np.transpose(np.array(f['rgb']),   (1, 2, 0)).astype(np.uint8)
-            depth_m = np.array(f['depth'], dtype=np.float32)  # already metres
+            depth_m = np.array(f['depth'], dtype=np.float32)
 
         image = Image.fromarray(rgb)
 
-        # ── Augmentation (train only) ─────────────────────────────────────────
         if self.augment:
             import torchvision.transforms.functional as TF
             import random
 
+            # ── 1. Horizontal flip ────────────────────────────────────────────────
             if random.random() > 0.5:
                 image   = TF.hflip(image)
                 depth_m = depth_m[:, ::-1].copy()
 
+            # ── 2. Random crop (85–100%) ──────────────────────────────────────────
             w, h      = image.size
             crop_frac = random.uniform(0.85, 1.0)
             ch, cw    = int(h * crop_frac), int(w * crop_frac)
@@ -422,24 +427,48 @@ class NYUDepthH5(Dataset):
             image     = TF.crop(image, top, left, ch, cw)
             depth_m   = depth_m[top:top + ch, left:left + cw]
 
-            image = transforms.ColorJitter(
-                brightness=0.3, contrast=0.3,
-                saturation=0.2, hue=0.05
-            )(image)
+            # ── 3. Depth scale jitter ─────────────────────────────────────────────
+            # Teach the model that absolute scale can vary; keeps relative structure
+            depth_m = depth_m * random.uniform(0.85, 1.15)
 
+            # ── 4. CutFlip (from PMC11243791 — improves REL ~4%) ─────────────────
+            # Split image at random horizontal line, flip top/bottom halves
+            # and swap their depth accordingly
+            if random.random() > 0.5:
+                cut = random.randint(ch // 4, 3 * ch // 4)
+                top_img   = np.array(image)[:cut]
+                bot_img   = np.array(image)[cut:]
+                top_dep   = depth_m[:cut]
+                bot_dep   = depth_m[cut:]
+                image   = Image.fromarray(np.concatenate([
+                    bot_img[::-1], top_img[::-1]], axis=0))
+                depth_m = np.concatenate([bot_dep[::-1], top_dep[::-1]], axis=0)
+
+            # ── 5. Rotation (±5°) — consistent on both modalities ────────────────
             if random.random() > 0.7:
                 angle   = random.uniform(-5, 5)
-                image   = TF.rotate(image, angle)
-                depth_m = TF.rotate(
-                    torch.from_numpy(depth_m).unsqueeze(0), angle
-                ).squeeze(0).numpy()
+                image   = TF.rotate(image, angle, interpolation=TF.InterpolationMode.BILINEAR)
+                dep_t   = torch.from_numpy(depth_m).unsqueeze(0)
+                depth_m = TF.rotate(dep_t, angle,
+                                    interpolation=TF.InterpolationMode.BILINEAR,
+                                    fill=0).squeeze(0).numpy()
+
+            # ── 6. Color / photometric augmentations (RGB only) ───────────────────
+            # Instantiate once, not per-call
+            image = self._color_jitter(image)    # see __init__ below
+
+            if random.random() > 0.8:
+                image = TF.gaussian_blur(image, kernel_size=5, sigma=(0.5, 1.5))
+                # ↑ Especially useful for DoGDepthNet — teaches multi-scale blur
+
+            if random.random() > 0.9:
+                image = TF.to_grayscale(image, num_output_channels=3)
 
         image = self.tf(image)
         depth = _resize_depth(depth_m, self.h, self.w).clamp(0, MAX_DEPTH)
         mask  = (depth > 0) & (depth <= MAX_DEPTH)
 
-        return {'image': image, 'depth': depth, 'mask': mask,
-                'scene': scene_name}   # ← free metadata for analysis
+        return {'image': image, 'depth': depth, 'mask': mask, 'scene': scene_name}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
