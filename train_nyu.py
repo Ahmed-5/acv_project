@@ -141,6 +141,14 @@ if __name__ == '__main__':
     # sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=NUM_EPOCHS)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode='min', factor=0.5, patience=3)
 
+    # code for loading from checkpoint if needed
+    # if os.path.exists(SAVE_PATH):
+    #     checkpoint = torch.load(SAVE_PATH)
+    #     student.load_state_dict(checkpoint['student'])
+    #     optim.load_state_dict(checkpoint['optim'])
+    #     sched.load_state_dict(checkpoint['sched'])
+    #     print(f"Loaded checkpoint from {SAVE_PATH}")
+
     total_p = sum(p.numel() for p in student.parameters())
     print(f"Params: {total_p/1e6:.2f}M | Device: {device}")
     print(f"Initial sigmas: {student.get_learned_sigmas()}")
