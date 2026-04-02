@@ -150,15 +150,19 @@ if __name__ == '__main__':
         verbose   = True     # prints when LR drops
     )
 
-    current_lr = sched.get_last_lr()[0]
-    print(f"Initial LR: {current_lr:.6f}")
-
     # code for loading from checkpoint if needed
     if os.path.exists(SAVE_PATH):
         checkpoint = torch.load(SAVE_PATH)
         student.load_state_dict(checkpoint['model_state'])
         optim.load_state_dict(checkpoint['optimizer_state'])
         print(f"Loaded checkpoint from {SAVE_PATH}")
+
+    # reset the learning rate
+    for param_group in optim.param_groups:
+        param_group['lr'] = LR
+
+    current_lr = sched.get_last_lr()[0]
+    print(f"Initial LR: {current_lr:.6f}")
 
     total_p = sum(p.numel() for p in student.parameters())
     print(f"Params: {total_p/1e6:.2f}M | Device: {device}")
