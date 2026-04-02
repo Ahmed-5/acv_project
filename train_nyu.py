@@ -150,6 +150,9 @@ if __name__ == '__main__':
         verbose   = True     # prints when LR drops
     )
 
+    current_lr = sched.get_last_lr()[0]
+    print(f"Initial LR: {current_lr:.6f}")
+
     # code for loading from checkpoint if needed
     # if os.path.exists(SAVE_PATH):
     #     checkpoint = torch.load(SAVE_PATH)
@@ -176,6 +179,10 @@ if __name__ == '__main__':
 
         elapsed = time.time() - t0
         mins, secs = divmod(int(elapsed), 60)
+
+        if sched.get_last_lr()[0] != current_lr:
+            current_lr = sched.get_last_lr()[0]
+            print(f"  → Learning rate reduced to {current_lr:.6f}")
 
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS} | "
               f"Time: {mins:02d}:{secs:02d} | "
