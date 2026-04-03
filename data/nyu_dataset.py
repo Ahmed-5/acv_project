@@ -431,18 +431,18 @@ class NYUDepthH5(Dataset):
             # Teach the model that absolute scale can vary; keeps relative structure
             depth_m = depth_m * random.uniform(0.85, 1.15)
 
-            # ── 4. CutFlip (from PMC11243791 — improves REL ~4%) ─────────────────
-            # Split image at random horizontal line, flip top/bottom halves
-            # and swap their depth accordingly
-            if random.random() > 0.5:
-                cut = random.randint(ch // 4, 3 * ch // 4)
-                top_img   = np.array(image)[:cut]
-                bot_img   = np.array(image)[cut:]
-                top_dep   = depth_m[:cut]
-                bot_dep   = depth_m[cut:]
-                image   = Image.fromarray(np.concatenate([
-                    bot_img[::-1], top_img[::-1]], axis=0))
-                depth_m = np.concatenate([bot_dep[::-1], top_dep[::-1]], axis=0)
+            # # ── 4. CutFlip (from PMC11243791 — improves REL ~4%) ─────────────────
+            # # Split image at random horizontal line, flip top/bottom halves
+            # # and swap their depth accordingly
+            # if random.random() > 0.5:
+            #     cut = random.randint(ch // 4, 3 * ch // 4)
+            #     top_img   = np.array(image)[:cut]
+            #     bot_img   = np.array(image)[cut:]
+            #     top_dep   = depth_m[:cut]
+            #     bot_dep   = depth_m[cut:]
+            #     image   = Image.fromarray(np.concatenate([
+            #         bot_img[::-1], top_img[::-1]], axis=0))
+            #     depth_m = np.concatenate([bot_dep[::-1], top_dep[::-1]], axis=0)
 
             # ── 5. Rotation (±5°) — consistent on both modalities ────────────────
             if random.random() > 0.7:
@@ -457,9 +457,9 @@ class NYUDepthH5(Dataset):
             # Instantiate once, not per-call
             image = self._color_jitter(image)    # see __init__ below
 
-            if random.random() > 0.8:
-                image = TF.gaussian_blur(image, kernel_size=5, sigma=(0.5, 1.5))
-                # ↑ Especially useful for DoGDepthNet — teaches multi-scale blur
+            # if random.random() > 0.8:
+            #     image = TF.gaussian_blur(image, kernel_size=5, sigma=(0.5, 1.5))
+            #     # ↑ Especially useful for DoGDepthNet — teaches multi-scale blur
 
             if random.random() > 0.9:
                 image = TF.to_grayscale(image, num_output_channels=3)
