@@ -1,0 +1,16 @@
+# --- H5 validation (.h5 under hf_dataset/data/val/official), same as train_nyu val ---
+--data-source h5
+--exps-only
+# SPIdepth needs ~>=64 patch tokens at 32px; default eval is 480,640 (not 320,416 for DoG).
+# --h5-img-size 480,640
+# Default --h5-val-dir is hf_dataset/data/val/official (repo-relative). Override if needed:
+# --h5-val-dir hf_dataset/data/val/official
+
+# --- SPIdepth sync layout (bedroom/ rgb+depth paths); requires --nyu-root to that tree ---
+# --exps-only
+# --nyu-root path/to/nyu_sync_root
+
+# --- NYU finetune checkpoint (comment others; use with list or h5) ---
+# --checkpoint path/to/your_finetune_best.pt
+# --data-source h5
+# --nyu-root ...   # only for --data-source list

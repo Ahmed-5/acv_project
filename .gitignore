@@ -7,3 +7,7 @@ checkpoints
 hf_dataset
 
 env
+
+spi_weights
+
+SPIdepth
