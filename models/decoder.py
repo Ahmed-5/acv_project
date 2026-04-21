@@ -29,7 +29,7 @@ class DoGAttentionGate(nn.Module):
 
 
 class DecoderBranch(nn.Module):
-    SKIP_CHS = [128, 96, 32, 24, 16]
+    SKIP_CHS = [128, 112, 40, 24, 16]
 
     def __init__(self, dog_fine_ch: int, dog_coarse_ch: int, out_ch: int = 64):
         super().__init__()
@@ -38,7 +38,7 @@ class DecoderBranch(nn.Module):
             DoGAttentionGate(self.SKIP_CHS[i], dog_chs[i])
             for i in range(5)
         ])
-        in_chs = [128, 96 + out_ch, 32 + out_ch, 24 + out_ch, 16 + out_ch]
+        in_chs = [self.SKIP_CHS[0]] + [c + out_ch for c in self.SKIP_CHS[1:]]
         self.convs = nn.ModuleList([
             nn.Sequential(
                 DSConvBlock(c, out_ch),

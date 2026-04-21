@@ -427,9 +427,7 @@ class NYUDepthH5(Dataset):
             image     = TF.crop(image, top, left, ch, cw)
             depth_m   = depth_m[top:top + ch, left:left + cw]
 
-            # ── 3. Depth scale jitter ─────────────────────────────────────────────
-            # Teach the model that absolute scale can vary; keeps relative structure
-            depth_m = depth_m * random.uniform(0.85, 1.15)
+            depth_m = depth_m * random.uniform(0.95, 1.05)
 
             # # ── 4. CutFlip (from PMC11243791 — improves REL ~4%) ─────────────────
             # # Split image at random horizontal line, flip top/bottom halves
@@ -444,9 +442,8 @@ class NYUDepthH5(Dataset):
             #         bot_img[::-1], top_img[::-1]], axis=0))
             #     depth_m = np.concatenate([bot_dep[::-1], top_dep[::-1]], axis=0)
 
-            # ── 5. Rotation (±5°) — consistent on both modalities ────────────────
             if random.random() > 0.7:
-                angle   = random.uniform(-5, 5)
+                angle   = random.uniform(-2.5, 2.5)
                 image   = TF.rotate(image, angle, interpolation=TF.InterpolationMode.BILINEAR)
                 dep_t   = torch.from_numpy(depth_m).unsqueeze(0)
                 depth_m = TF.rotate(dep_t, angle,
@@ -463,6 +460,17 @@ class NYUDepthH5(Dataset):
 
             if random.random() > 0.9:
                 image = TF.to_grayscale(image, num_output_channels=3)
+
+            if random.random() > 0.75:
+                iw, ih = image.size
+                cw_ = random.randint(int(0.05 * iw), int(0.20 * iw))
+                ch_ = random.randint(int(0.05 * ih), int(0.20 * ih))
+                cx = random.randint(0, iw - cw_)
+                cy = random.randint(0, ih - ch_)
+                arr = np.array(image)
+                fill = np.array([int(255 * c) for c in NYU_MEAN], dtype=arr.dtype)
+                arr[cy:cy + ch_, cx:cx + cw_] = fill
+                image = Image.fromarray(arr)
 
         image = self.tf(image)
         depth = _resize_depth(depth_m, self.h, self.w).clamp(0, MAX_DEPTH)

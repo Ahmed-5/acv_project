@@ -95,14 +95,8 @@ def build_val_loader(args):
     )
 
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    """
-    Per-sample median scaling (same as train_nyu.evaluate), then aggregate means.
-    δ_k: fraction of valid pixels with max(pred/gt, gt/pred) < 1.25^k.
-    """
-    model.eval()
-    agg = {
+def _empty_agg():
+    return {
         "a1": [],
         "a2": [],
         "a3": [],
@@ -113,35 +107,12 @@ def evaluate(model, loader, device):
         "rmse_log": [],
         "silog": [],
     }
-    skipped = 0
-    for batch in tqdm(loader, desc="Evaluating"):
-        image = batch["image"].to(device)
-        depth_gt = batch["depth"].to(device)
-        mask = batch["mask"].squeeze(1).to(device)
-        pred = F.interpolate(
-            model(image), size=depth_gt.shape[-2:], mode="bilinear", align_corners=False
-        ).squeeze(1)
-        gt = depth_gt.squeeze(1)
-        for b in range(pred.shape[0]):
-            p, g = pred[b][mask[b]], gt[b][mask[b]]
-            if p.numel() < 10:
-                skipped += 1
-                continue
-            scale = torch.median(g) / (torch.median(p) + 1e-8)
-            p = p * scale
-            p_np = p.detach().cpu().numpy().astype(np.float64)
-            g_np = g.detach().cpu().numpy().astype(np.float64)
-            p_np = np.clip(p_np, 1e-3, 10.0)
-            g_np = np.clip(g_np, 1e-3, 10.0)
 
-            m = compute_errors(g_np, p_np)
-            for k, v in m.items():
-                agg[k].append(v)
 
+def _aggregate(agg, skipped, num):
     out = {k: (float(np.mean(v)) if v else float("nan")) for k, v in agg.items()}
     out["skipped"] = int(skipped)
-    out["num_images"] = int(len(agg["a1"]))
-    # Backward-compatible aliases used by previous output.
+    out["num_images"] = int(num)
     out["AbsRel"] = out["abs_rel"]
     out["RMSE"] = out["rmse"]
     out["delta1"] = out["a1"]
@@ -150,14 +121,92 @@ def evaluate(model, loader, device):
     return out
 
 
-def load_model(device, checkpoint_path, sigma_pairs, branch_ch, pretrained_backbone):
+@torch.no_grad()
+def evaluate(model, loader, device, tta_hflip=False, eigen_crop=False,
+             garg_crop=False, min_depth=1e-3, max_depth=10.0):
+    """
+    Returns two metric dicts: with and without per-image median scaling.
+    Optional eval-time TTA (horizontal flip) and crops (Eigen / Garg).
+    """
+    model.eval()
+    agg_med = _empty_agg()
+    agg_raw = _empty_agg()
+    skipped = 0
+    n = 0
+
+    for batch in tqdm(loader, desc="Evaluating"):
+        image = batch["image"].to(device)
+        depth_gt = batch["depth"].to(device)
+        mask = batch["mask"].squeeze(1).to(device)
+
+        pred = model(image)
+        if tta_hflip:
+            pred_flip = model(torch.flip(image, dims=[-1]))
+            pred = 0.5 * (pred + torch.flip(pred_flip, dims=[-1]))
+        pred = F.interpolate(pred, size=depth_gt.shape[-2:],
+                             mode="bilinear", align_corners=False).squeeze(1)
+        gt = depth_gt.squeeze(1)
+
+        for b in range(pred.shape[0]):
+            valid = mask[b]
+            if eigen_crop or garg_crop:
+                h, w = valid.shape
+                em = torch.zeros_like(valid)
+                if garg_crop:
+                    t0 = int(round(0.40810811 * h)); t1 = int(round(0.99189189 * h))
+                    l0 = int(round(0.03594771 * w)); l1 = int(round(0.96405229 * w))
+                else:
+                    t0 = int(round(45 * h / 480)); t1 = int(round(471 * h / 480))
+                    l0 = int(round(41 * w / 640)); l1 = int(round(601 * w / 640))
+                em[t0:t1, l0:l1] = True
+                valid = valid & em
+
+            p, g = pred[b][valid], gt[b][valid]
+            if p.numel() < 10:
+                skipped += 1
+                continue
+
+            p_np_raw = p.detach().cpu().numpy().astype(np.float64)
+            g_np = g.detach().cpu().numpy().astype(np.float64)
+            p_np_raw = np.clip(p_np_raw, min_depth, max_depth)
+            g_np = np.clip(g_np, min_depth, max_depth)
+            for k, v in compute_errors(g_np, p_np_raw).items():
+                agg_raw[k].append(v)
+
+            scale = float(np.clip(np.median(g_np) / (np.median(p_np_raw) + 1e-8), 0.1, 10.0))
+            p_np_med = np.clip(p_np_raw * scale, min_depth, max_depth)
+            for k, v in compute_errors(g_np, p_np_med).items():
+                agg_med[k].append(v)
+
+            n += 1
+
+    return {
+        "median_scaled": _aggregate(agg_med, skipped, n),
+        "no_scaling": _aggregate(agg_raw, skipped, n),
+    }
+
+
+def load_model(device, checkpoint_path, sigma_pairs, branch_ch,
+               pretrained_backbone, n_bins=64, min_depth=1e-3, max_depth=10.0,
+               use_ema=False):
     model = DoGDepthNet(
         sigma_pairs=sigma_pairs,
         branch_ch=branch_ch,
+        n_bins=n_bins,
+        min_depth=min_depth,
+        max_depth=max_depth,
         pretrained=pretrained_backbone,
     ).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
-    state = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+    if isinstance(ckpt, dict):
+        if use_ema and "ema_state" in ckpt:
+            state = ckpt["ema_state"]
+        elif "model_state" in ckpt:
+            state = ckpt["model_state"]
+        else:
+            state = ckpt
+    else:
+        state = ckpt
     model.load_state_dict(state, strict=True)
     return model, ckpt if isinstance(ckpt, dict) else {}
 
@@ -183,7 +232,17 @@ def main():
     )
     p.add_argument("--sigma-pairs", type=str, default="0.5,1.0;1.0,2.0;2.0,4.0", help="Semicolon-separated a,b pairs")
     p.add_argument("--branch-ch", type=int, default=64)
-    # h5
+    p.add_argument("--n-bins", type=int, default=64)
+    p.add_argument("--min-depth", type=float, default=1e-3)
+    p.add_argument("--max-depth", type=float, default=10.0)
+    p.add_argument("--use-ema", action="store_true",
+                   help="Load ema_state from checkpoint instead of model_state.")
+    p.add_argument("--tta-hflip", action="store_true",
+                   help="Average prediction with horizontally-flipped pass.")
+    p.add_argument("--eigen-crop", action="store_true",
+                   help="Apply Eigen NYU crop to the eval mask.")
+    p.add_argument("--garg-crop", action="store_true",
+                   help="Apply Garg NYU crop to the eval mask.")
     p.add_argument("--h5-val-dir", type=str, default="./hf_dataset/data/val/")
     # mat
     p.add_argument("--mat-path", type=str, default=None)
@@ -220,6 +279,10 @@ def main():
         args.sigma_pairs,
         args.branch_ch,
         pretrained_backbone=not args.no_pretrained_backbone,
+        n_bins=args.n_bins,
+        min_depth=args.min_depth,
+        max_depth=args.max_depth,
+        use_ema=args.use_ema,
     )
     print(f"Loaded checkpoint: {args.checkpoint}")
     if ckpt_meta.get("epoch") is not None:
@@ -227,33 +290,35 @@ def main():
     if ckpt_meta.get("learned_sigmas") is not None:
         print(f"  stored learned_sigmas: {ckpt_meta['learned_sigmas']}")
     print(f"  current learned_sigmas: {model.get_learned_sigmas()}")
+    print(f"  use_ema={args.use_ema} tta_hflip={args.tta_hflip} "
+          f"eigen_crop={args.eigen_crop} garg_crop={args.garg_crop}")
 
-    metrics = evaluate(model, val_loader, device)
-    full_metrics = {
-        "a1": round(metrics["a1"], 4),
-        "a2": round(metrics["a2"], 4),
-        "a3": round(metrics["a3"], 4),
-        "abs_rel": round(metrics["abs_rel"], 4),
-        "sq_rel": round(metrics["sq_rel"], 4),
-        "rmse": round(metrics["rmse"], 4),
-        "log_10": round(metrics["log_10"], 4),
-        "rmse_log": round(metrics["rmse_log"], 4),
-        "silog": round(metrics["silog"], 4),
-        "skipped": metrics["skipped"],
-    }
-    print(f"Metrics: {full_metrics}")
-    print(
-        f"AbsRel: {metrics['AbsRel']:.4f} | RMSE: {metrics['RMSE']:.4f} | "
-        f"d1: {metrics['delta1']:.4f} | d2: {metrics['delta2']:.4f} | d3: {metrics['delta3']:.4f} | "
-        f"n={metrics['num_images']}"
-    )
+    bundle = evaluate(model, val_loader, device,
+                      tta_hflip=args.tta_hflip,
+                      eigen_crop=args.eigen_crop,
+                      garg_crop=args.garg_crop,
+                      min_depth=args.min_depth,
+                      max_depth=args.max_depth)
+
+    def _round(d):
+        return {k: (round(v, 4) if isinstance(v, float) else v)
+                for k, v in d.items()
+                if k in ("a1", "a2", "a3", "abs_rel", "sq_rel", "rmse",
+                         "log_10", "rmse_log", "silog", "skipped")}
+
+    print(f"Metrics (median-scaled): {_round(bundle['median_scaled'])}")
+    print(f"Metrics (no scaling)   : {_round(bundle['no_scaling'])}")
 
     if args.json_out:
         out = {
             "checkpoint": os.path.abspath(args.checkpoint),
             "mode": args.mode,
             "img_size": list(args.img_size),
-            **metrics,
+            "use_ema": args.use_ema,
+            "tta_hflip": args.tta_hflip,
+            "eigen_crop": args.eigen_crop,
+            "garg_crop": args.garg_crop,
+            **bundle,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.json_out)) or ".", exist_ok=True)
         with open(args.json_out, "w", encoding="utf-8") as f:
