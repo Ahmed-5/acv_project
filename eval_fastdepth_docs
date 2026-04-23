@@ -11,3 +11,16 @@ python eval_fastdepth_nyu.py --variant v2 --eigen-crop --num-workers 0 --device 
 python eval_fastdepth_nyu.py --variant v2 `
     --checkpoint fastdepth_ref/Weights/FastDepthV2_RMSLEGN_Best.pth `
     --ckpt-key v2-rmslegn --eigen-crop --num-workers 0 --device cpu
+
+
+# INFERENCE:
+
+# single image, auto-download v1 weights, outputs next to the input
+python infer_fastdepth.py --variant v1 --input demo.jpg
+
+# whole folder, v2 weights, outputs in ./preds/ with RGB|depth comparisons
+python infer_fastdepth.py --variant v2 --input ./my_images \
+    --output-dir ./preds --side-by-side --native-resolution
+
+# specific training variant (v2 + RMSLE + GroupNorm)
+python infer_fastdepth.py --ckpt-key v2-rmslegn --input demo.jpg
