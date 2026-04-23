@@ -1,0 +1,13 @@
+# Simplest: auto-fetches default V1 (L1) weights if not cached, then evals
+python eval_fastdepth_nyu.py --variant v1 --eigen-crop --num-workers 0 --device cpu
+
+# Pick a specific variant explicitly (e.g. the L1+Gradient+Normal V1)
+python eval_fastdepth_nyu.py --ckpt-key v1-l1gn --eigen-crop --num-workers 0 --device cpu
+
+# V2 (MobileNetV2 backbone)
+python eval_fastdepth_nyu.py --variant v2 --eigen-crop --num-workers 0 --device cpu
+
+# Still works: explicit path (and will auto-download if missing + filename is known)
+python eval_fastdepth_nyu.py --variant v2 `
+    --checkpoint fastdepth_ref/Weights/FastDepthV2_RMSLEGN_Best.pth `
+    --ckpt-key v2-rmslegn --eigen-crop --num-workers 0 --device cpu

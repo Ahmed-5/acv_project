@@ -11,3 +11,13 @@ env
 spi_weights
 
 SPIdepth
+
+# FastDepth reference: keep the code (models.py, shim, __init__.py) but not
+# the ~23 MB per-file pretrained weights (they are auto-downloaded on demand
+# by eval_fastdepth_nyu.py).
+fastdepth_ref/Weights/
+*.part
+
+# Evaluation outputs
+results/
+my_eval.txt
