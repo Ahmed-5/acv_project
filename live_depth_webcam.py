@@ -1,5 +1,7 @@
 """
 Live webcam: show RGB plus DoGDepthNet and FastDepth depth maps side by side.
+Each depth map has a vertical colorbar (same matplotlib ``--cmap`` as the image)
+with numeric ticks for the 2-98%ile depth range used to stretch colours.
 
 Preprocessing matches ``eval_nyu.py`` / ``eval_fastdepth_nyu.py`` (ImageNet norm at
 ``--img-size`` for DoG; un-normalise to [0,1] and 224x224 for FastDepth).
@@ -51,6 +53,79 @@ from infer_fastdepth import _colourise
 _DEFAULT_PANEL_LABELS = ("Camera (RGB)", "DoGDepthNet", "FastDepth")
 
 
+def _fmt_depth_m(x: float) -> str:
+    ax = abs(x)
+    if ax >= 10:
+        return f"{x:.0f}"
+    if ax >= 1:
+        return f"{x:.2f}"
+    if ax >= 0.01:
+        return f"{x:.3f}"
+    return f"{x:.4g}"
+
+
+def _viz_depth_range_m(depth: np.ndarray) -> tuple[float, float]:
+    """2nd–98th percentile of finite depths (same idea as ``infer_fastdepth._colourise``)."""
+    d = depth.astype(np.float32)
+    finite = np.isfinite(d)
+    if not finite.any():
+        return 0.0, 1.0
+    lo = float(np.percentile(d[finite], 2))
+    hi = float(np.percentile(d[finite], 98))
+    if hi - lo < 1e-6:
+        hi = lo + 1e-6
+    return lo, hi
+
+
+def _vertical_colorbar_bgr(height: int, bar_width: int, cmap_name: str) -> np.ndarray:
+    """Vertical ramp top=t=0 (maps to ``lo``), bottom=t=1 (maps to ``hi``), as in ``_colourise``."""
+    bw = max(1, bar_width)
+    t = np.linspace(0.0, 1.0, height, dtype=np.float32)
+    t = np.repeat(t[:, np.newaxis], bw, axis=1)
+    try:
+        import matplotlib
+        cmap = matplotlib.colormaps.get_cmap(cmap_name)
+        rgba = cmap(t)
+        rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+        bar = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        g = (t * 255.0).astype(np.uint8)
+        bar = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+    cv2.rectangle(bar, (0, 0), (bar.shape[1] - 1, bar.shape[0] - 1), (220, 220, 220), 1)
+    return bar
+
+
+def _colorbar_column_bgr(
+    height: int,
+    cmap_name: str,
+    lo: float,
+    hi: float,
+    bar_width: int,
+    label_pad: int,
+) -> np.ndarray:
+    """Colorbar strip plus tick labels (hi at top, lo at bottom) in metres."""
+    bar = _vertical_colorbar_bgr(height, bar_width, cmap_name)
+    lp = max(36, label_pad)
+    labels = np.zeros((height, lp, 3), dtype=np.uint8)
+    labels[:] = (28, 28, 28)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = float(np.clip(height / 420.0 * 0.55, 0.38, 0.72))
+    th = 1
+    hi_s = _fmt_depth_m(hi)
+    lo_s = _fmt_depth_m(lo)
+    margin = max(4, height // 55)
+    (tw_h, th_h), bl_h = cv2.getTextSize(hi_s, font, scale, th)
+    cv2.putText(labels, hi_s, (0, margin + th_h), font, scale, (235, 235, 235), th, cv2.LINE_AA)
+    (tw_l, th_l), bl_l = cv2.getTextSize(lo_s, font, scale, th)
+    cv2.putText(labels, lo_s, (0, height - margin - bl_l), font, scale, (235, 235, 235), th, cv2.LINE_AA)
+    unit_scale = scale * 0.82
+    (tw_u, th_u), _ = cv2.getTextSize("m", font, unit_scale, th)
+    cv2.putText(
+        labels, "m", (0, (height + th_u) // 2), font, unit_scale, (160, 160, 160), th, cv2.LINE_AA)
+    gap = np.full((height, 2, 3), 18, dtype=np.uint8)
+    return np.concatenate([bar, gap, labels], axis=1)
+
+
 def _parse_sigma_pairs(s: str):
     pairs = []
     for chunk in s.split(";"):
@@ -62,21 +137,44 @@ def _parse_sigma_pairs(s: str):
     return pairs
 
 
-def _draw_panel_label(img_bgr: np.ndarray, text: str) -> np.ndarray:
-    """Return a copy of ``img_bgr`` with a readable title at the top-left."""
+def _draw_panel_label(
+    img_bgr: np.ndarray,
+    text: str,
+    extra_lines: tuple[str, ...] = (),
+) -> np.ndarray:
+    """Return a copy of ``img_bgr`` with a title and optional smaller lines at top-left."""
     out = img_bgr.copy()
-    h = out.shape[0]
+    h, w_img = out.shape[:2]
     margin = max(6, h // 50)
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = float(np.clip(h / 360.0 * 0.9, 0.5, 1.15))
-    thickness = max(1, int(round(scale * 2)))
-    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
-    box_w = tw + margin * 2
-    box_h = th + baseline + margin * 2
-    cv2.rectangle(out, (0, 0), (min(out.shape[1] - 1, box_w), min(h - 1, box_h)),
-                  (0, 0, 0), -1)
-    org = (margin, margin + th)
-    cv2.putText(out, text, org, font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    main_scale = float(np.clip(h / 360.0 * 0.9, 0.5, 1.15))
+    sub_scale = main_scale * 0.58
+    main_th = max(1, int(round(main_scale * 2)))
+    sub_th = max(1, int(round(sub_scale * 2)))
+
+    lines: list[tuple[str, float, int]] = [(text, main_scale, main_th)]
+    for ex in extra_lines:
+        lines.append((ex, sub_scale, sub_th))
+
+    line_sizes: list[tuple[int, int, int, float, int]] = []
+    max_tw = 0
+    total_h = margin
+    for line, sc, th in lines:
+        (tw, th_px), bl = cv2.getTextSize(line, font, sc, th)
+        line_sizes.append((tw, th_px, bl, sc, th))
+        max_tw = max(max_tw, tw)
+        total_h += th_px + bl + max(2, margin // 3)
+    total_h += margin // 2
+
+    box_w = min(w_img - 1, max_tw + margin * 2)
+    box_h = min(h - 1, total_h)
+    cv2.rectangle(out, (0, 0), (box_w, box_h), (0, 0, 0), -1)
+
+    y = margin
+    for line, (_, th_px, bl, sc, th) in zip([L[0] for L in lines], line_sizes):
+        y += th_px
+        cv2.putText(out, line, (margin, y), font, sc, (255, 255, 255), th, cv2.LINE_AA)
+        y += bl + max(2, margin // 3)
     return out
 
 
@@ -86,19 +184,37 @@ def _stack_panels(
     fd_bgr: np.ndarray,
     target_h: int,
     labels: tuple[str, str, str] | None = None,
+    extra_lines: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None = None,
+    *,
+    cmap_name: str = "magma",
+    depth_colormap_ranges: tuple[tuple[float, float], tuple[float, float]] | None = None,
+    colorbar_bar_width: int = 22,
+    colorbar_label_width: int = 52,
 ) -> np.ndarray:
-    """Resize each panel to height ``target_h``, annotate, concatenate horizontally."""
+    """Resize each panel to height ``target_h``, annotate; depth columns get a colorbar."""
     if labels is None:
         labels = _DEFAULT_PANEL_LABELS
+    if extra_lines is None:
+        extra_lines = ((), (), ())
     panels = []
-    for img, label in zip((rgb_bgr, dog_bgr, fd_bgr), labels):
+    for idx, (img, label, extras) in enumerate(
+            zip((rgb_bgr, dog_bgr, fd_bgr), labels, extra_lines)):
         h, w = img.shape[:2]
         if h <= 0 or w <= 0:
             continue
         scale = target_h / h
         new_w = max(1, int(round(w * scale)))
         panel = cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA)
-        panels.append(_draw_panel_label(panel, label))
+        panel = _draw_panel_label(panel, label, extras)
+        if idx > 0 and depth_colormap_ranges is not None:
+            lo, hi = depth_colormap_ranges[idx - 1]
+            cb = _colorbar_column_bgr(
+                panel.shape[0], cmap_name, lo, hi,
+                colorbar_bar_width, colorbar_label_width,
+            )
+            sep = np.full((panel.shape[0], 3, 3), 40, dtype=np.uint8)
+            panel = np.concatenate([panel, sep, cb], axis=1)
+        panels.append(panel)
     return np.concatenate(panels, axis=1)
 
 
@@ -151,6 +267,10 @@ def main():
     p.add_argument("--display-height", type=int, default=360,
                    help="Pixel height of each panel in the OpenCV window.")
     p.add_argument("--cmap", type=str, default="magma", help="Matplotlib colormap for depth.")
+    p.add_argument("--colorbar-width", type=int, default=22,
+                   help="Width (px) of the vertical colorbar gradient beside each depth map.")
+    p.add_argument("--colorbar-label-width", type=int, default=52,
+                   help="Width (px) for min/max depth labels next to each colorbar.")
     p.add_argument("--window", type=str, default="RGB | DoGDepthNet | FastDepth")
     p.add_argument(
         "--display",
@@ -298,7 +418,19 @@ def main():
             dog_color = cv2.cvtColor(_colourise(dog_np, args.cmap), cv2.COLOR_RGB2BGR)
             fd_color = cv2.cvtColor(_colourise(fd_np, args.cmap), cv2.COLOR_RGB2BGR)
 
-            composite = _stack_panels(frame_bgr, dog_color, fd_color, args.display_height)
+            dog_vlo, dog_vhi = _viz_depth_range_m(dog_np)
+            fd_vlo, fd_vhi = _viz_depth_range_m(fd_np)
+            mn, mx = args.min_depth, args.max_depth
+            clip_line = (f"depth (m), clipped to [{_fmt_depth_m(mn)}, {_fmt_depth_m(mx)}]",)
+            panel_extras = ((), clip_line, clip_line)
+            composite = _stack_panels(
+                frame_bgr, dog_color, fd_color, args.display_height,
+                extra_lines=panel_extras,
+                cmap_name=args.cmap,
+                depth_colormap_ranges=((dog_vlo, dog_vhi), (fd_vlo, fd_vhi)),
+                colorbar_bar_width=args.colorbar_width,
+                colorbar_label_width=args.colorbar_label_width,
+            )
 
             if display_backend == "opencv":
                 cv2.imshow(args.window, composite)
