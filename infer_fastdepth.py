@@ -25,9 +25,15 @@ Examples:
 
   # specific checkpoint key (e.g. v2 trained with RMSLE + group norm)
   python infer_fastdepth.py --ckpt-key v2-rmslegn --input demo.jpg
+
+  # median-scale predictions to metric GT (same rule as eval_fastdepth_nyu)
+  python infer_fastdepth.py --variant v1 --input depthData/runs/merged/rgb \\
+      --gt-depth-dir depthData/runs/merged/depth --gt-depth-scale 0.001 \\
+      --native-resolution --output-dir preds/ --save-raw-pred
 """
 import argparse
 import glob
+import json
 import os
 import sys
 from typing import List, Tuple
@@ -40,6 +46,7 @@ from tqdm import tqdm
 
 # Re-use the download + loading pipeline from the eval script. This also
 # triggers the ``nyudepthv2`` shim registration needed by torch.load.
+from data.nyu_dataset import REALSENSE_DEFAULT_DEPTH_SCALE
 from eval_fastdepth_nyu import (
     FASTDEPTH_CHECKPOINTS,
     FASTDEPTH_INPUT,
@@ -116,6 +123,42 @@ def _default_output_path(src: str, output_dir: str | None, suffix: str, ext: str
     return os.path.join(out_dir, f"{stem}{suffix}.{ext}")
 
 
+def _find_gt_depth_path(rgb_path: str, gt_dir: str) -> str | None:
+    base = os.path.basename(rgb_path)
+    stem, _ = os.path.splitext(base)
+    for cand in (base, f"{stem}.png", f"{stem}.PNG"):
+        p = os.path.join(gt_dir, cand)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _load_gt_depth_metres(path: str, uint16_scale: float) -> np.ndarray:
+    arr = np.array(Image.open(path))
+    if arr.dtype == np.uint16:
+        return arr.astype(np.float32) * float(uint16_scale)
+    return arr.astype(np.float32)
+
+
+def _resize_depth_nearest(depth: np.ndarray, h: int, w: int) -> np.ndarray:
+    t = torch.from_numpy(depth).float().unsqueeze(0).unsqueeze(0)
+    return F.interpolate(t, size=(h, w), mode="nearest").squeeze().numpy()
+
+
+def _median_scale_factor(pred: np.ndarray, gt_m: np.ndarray,
+                         min_d: float, max_d: float) -> float:
+    """Same ratio as eval_fastdepth_nyu / eval_nyu (per-image median alignment)."""
+    valid = (gt_m > min_d) & (gt_m <= max_d) & (pred > min_d) & np.isfinite(pred) & np.isfinite(gt_m)
+    if valid.sum() < 10:
+        return 1.0
+    g = gt_m[valid].astype(np.float64)
+    p = pred[valid].astype(np.float64)
+    p = np.clip(p, min_d, max_d)
+    g = np.clip(g, min_d, max_d)
+    scale = float(np.median(g) / (np.median(p) + 1e-8))
+    return float(np.clip(scale, 0.1, 10.0))
+
+
 @torch.no_grad()
 def run_inference(model: torch.nn.Module, image_paths: List[str], *,
                   device: torch.device,
@@ -126,8 +169,13 @@ def run_inference(model: torch.nn.Module, image_paths: List[str], *,
                   cmap: str,
                   min_depth: float,
                   max_depth: float,
-                  keep_input_resolution: bool) -> None:
+                  keep_input_resolution: bool,
+                  gt_depth_dir: str | None = None,
+                  gt_depth_scale: float = REALSENSE_DEFAULT_DEPTH_SCALE,
+                  save_raw_pred: bool = False,
+                  scales_json_path: str | None = None) -> None:
     model.eval()
+    scales_log: list[dict] = []
     for src in tqdm(image_paths, desc="Inferring"):
         try:
             inp, (H, W) = _load_image_tensor(src, device)
@@ -140,8 +188,35 @@ def run_inference(model: torch.nn.Module, image_paths: List[str], *,
         if keep_input_resolution:
             pred = F.interpolate(pred, size=(H, W),
                                  mode="bilinear", align_corners=False)
-        depth = pred.squeeze().detach().cpu().numpy().astype(np.float32)
-        depth = np.clip(depth, min_depth, max_depth)
+        depth_raw = pred.squeeze().detach().cpu().numpy().astype(np.float32)
+        depth_raw = np.clip(depth_raw, min_depth, max_depth)
+
+        scale_applied = 1.0
+        depth = depth_raw
+        gt_path = None
+        if gt_depth_dir:
+            gt_path = _find_gt_depth_path(src, gt_depth_dir)
+            if gt_path is None:
+                print(f"  [warn] no GT depth for {os.path.basename(src)} in {gt_depth_dir!r}; saving unscaled")
+            else:
+                try:
+                    gt_m = _load_gt_depth_metres(gt_path, gt_depth_scale)
+                    gt_m = _resize_depth_nearest(gt_m, depth_raw.shape[0], depth_raw.shape[1])
+                    scale_applied = _median_scale_factor(depth_raw, gt_m, min_depth, max_depth)
+                    depth = np.clip(depth_raw * scale_applied, min_depth, max_depth)
+                except Exception as e:
+                    print(f"  [warn] GT load/scale failed for {src}: {e}; saving unscaled")
+                    depth = depth_raw
+                    scale_applied = 1.0
+            scales_log.append({
+                "rgb": os.path.abspath(src),
+                "gt_depth": os.path.abspath(gt_path) if gt_path else None,
+                "median_scale": scale_applied,
+            })
+
+        if save_raw_pred and gt_depth_dir and scale_applied != 1.0:
+            raw_path = _default_output_path(src, output_dir, "_depth_raw", "npy")
+            np.save(raw_path, depth_raw)
 
         if save_npy:
             npy_path = _default_output_path(src, output_dir, "_depth", "npy")
@@ -164,6 +239,13 @@ def run_inference(model: torch.nn.Module, image_paths: List[str], *,
                 combo = np.concatenate([rgb, depth_rgb], axis=1)
                 sbs_path = _default_output_path(src, output_dir, "_sidebyside", "png")
                 Image.fromarray(combo).save(sbs_path)
+
+    if scales_json_path and scales_log:
+        outp = os.path.abspath(scales_json_path)
+        os.makedirs(os.path.dirname(outp) or ".", exist_ok=True)
+        with open(outp, "w", encoding="utf-8") as f:
+            json.dump(scales_log, f, indent=2)
+        print(f"Wrote per-image median scales to {outp}")
 
 
 def main():
@@ -204,6 +286,17 @@ def main():
     p.add_argument("--side-by-side", action="store_true",
                    help="Additionally save an RGB|depth concatenated PNG "
                         "(uses native image resolution).")
+    p.add_argument("--gt-depth-dir", type=str, default=None,
+                   help="Folder of GT depth PNGs (paired by filename with each RGB). "
+                        "If set, apply per-image median scaling to predictions before save "
+                        "(same as eval_nyu / eval_fastdepth 'median_scaled').")
+    p.add_argument("--gt-depth-scale", type=float, default=REALSENSE_DEFAULT_DEPTH_SCALE,
+                   help="Metres per uint16 unit for GT depth PNGs (RealSense default 0.001).")
+    p.add_argument("--save-raw-pred", action="store_true",
+                   help="With --gt-depth-dir: also save unscaled network output as "
+                        "*_depth_raw.npy next to *_depth.npy.")
+    p.add_argument("--scales-json", type=str, default=None,
+                   help="Optional path to write per-image median_scale factors as JSON.")
     args = p.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -256,6 +349,10 @@ def main():
         min_depth=args.min_depth,
         max_depth=args.max_depth,
         keep_input_resolution=args.native_resolution,
+        gt_depth_dir=args.gt_depth_dir,
+        gt_depth_scale=args.gt_depth_scale,
+        save_raw_pred=args.save_raw_pred,
+        scales_json_path=args.scales_json,
     )
     print("Done.")
 

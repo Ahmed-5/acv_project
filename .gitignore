@@ -21,3 +21,7 @@ fastdepth_ref/Weights/
 # Evaluation outputs
 results/
 my_eval.txt
+
+# Local RealSense capture runs (large PNG sequences)
+depthData/
+depthData/runs/

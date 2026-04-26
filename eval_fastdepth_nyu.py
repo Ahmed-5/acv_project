@@ -29,6 +29,10 @@ Example:
       --checkpoint fastdepth_ref/Weights/FastDepth_L1_Best.pth \
       --h5-val-dir ./hf_dataset/data/val/ \
       --eigen-crop --num-workers 0
+
+  # RealSense capture folder (rgb/, depth/, meta.json)
+  python eval_fastdepth_nyu.py --mode realsense --rs-root depthData/runs/my_run \\
+      --variant v1 --img-size 320,416 --num-workers 0
 """
 import argparse
 import json
@@ -50,7 +54,7 @@ from tqdm import tqdm
 from fastdepth_ref import nyudepthv2_shim as _nyudepthv2_shim
 sys.modules.setdefault("nyudepthv2", _nyudepthv2_shim)
 
-from data.nyu_dataset import NYUDepthH5, NYU_MEAN, NYU_STD
+from data.nyu_dataset import NYUDepthH5, NYU_MEAN, NYU_STD, RealSenseAlignedPNG
 from eval_nyu import compute_errors, _aggregate, _empty_agg, parse_img_size
 from fastdepth_ref.models import FastDepth, FastDepthV2
 
@@ -298,7 +302,20 @@ def main():
                         "FastDepth checkpoint (e.g. v1-l1gn, v2-rmslegn). Overrides --variant.")
     p.add_argument("--weights-dir", type=str, default=WEIGHTS_DIR,
                    help="Local cache directory for auto-downloaded weights.")
+    p.add_argument("--mode", type=str, default="h5", choices=("h5", "realsense"),
+                   help="h5 = NYUDepthH5 val; realsense = depthData run (rgb/depth PNGs).")
     p.add_argument("--h5-val-dir", type=str, default="./hf_dataset/data/val/")
+    p.add_argument("--rs-root", type=str, default=None,
+                   help="Run folder for --mode realsense (SAVE_DIR from collect_data.py).")
+    p.add_argument("--rs-rgb-subdir", type=str, default=None,
+                   help="Optional colour subfolder (default: auto-detect rgb, color, …).")
+    p.add_argument("--rs-depth-subdir", type=str, default=None,
+                   help="Optional depth subfolder (default: auto-detect depth, …).")
+    p.add_argument("--rs-depth-scale", type=float, default=None,
+                   help="Override depth_scale (m per uint16); default from meta.json.")
+    p.add_argument("--rs-color-space", type=str, default=None,
+                   choices=("rgb", "bgr_on_disk"),
+                   help="rgb = true RGB PNGs; bgr_on_disk = legacy OpenCV BGR save.")
     p.add_argument("--img-size", type=parse_img_size, default="480,640",
                    help="Eval H,W (GT resolution). 480,640 = native NYU.")
     p.add_argument("--batch-size", type=int, default=8)
@@ -358,7 +375,20 @@ def main():
         if "args" in meta and hasattr(meta["args"], "criterion"):
             print(f"  training criterion: {meta['args'].criterion}")
 
-    val_ds = NYUDepthH5(args.h5_val_dir, img_size=args.img_size, augment=False)
+    if args.mode == "h5":
+        val_ds = NYUDepthH5(args.h5_val_dir, img_size=args.img_size, augment=False)
+    else:
+        if not args.rs_root:
+            raise ValueError("--rs-root is required when --mode realsense")
+        val_ds = RealSenseAlignedPNG(
+            args.rs_root,
+            args.img_size,
+            depth_scale=args.rs_depth_scale,
+            max_depth=args.max_depth,
+            color_space=args.rs_color_space,
+            rgb_subdir=args.rs_rgb_subdir,
+            depth_subdir=args.rs_depth_subdir,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
@@ -366,8 +396,8 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    print(f"Val samples: {len(val_ds)} | batches: {len(val_loader)} | "
-          f"eval resolution: {args.img_size}")
+    print(f"Data mode: {args.mode} | Val samples: {len(val_ds)} | "
+          f"batches: {len(val_loader)} | eval resolution: {args.img_size}")
     print(f"  tta_hflip={args.tta_hflip} eigen_crop={args.eigen_crop} "
           f"garg_crop={args.garg_crop}")
 
@@ -384,7 +414,7 @@ def main():
         return {k: (round(v, 4) if isinstance(v, float) else v)
                 for k, v in d.items() if k in keep}
 
-    print(f"Metrics (median-scaled): {_round(bundle['median_scaled'])}")
+    print(f"Metrics (median-scaled per image): {_round(bundle['median_scaled'])}")
     print(f"Metrics (no scaling)   : {_round(bundle['no_scaling'])}")
 
     if args.json_out:
@@ -392,6 +422,9 @@ def main():
             "checkpoint": os.path.abspath(ckpt_path),
             "variant": args.variant,
             "params": n_params,
+            "data_mode": args.mode,
+            "h5_val_dir": args.h5_val_dir if args.mode == "h5" else None,
+            "rs_root": os.path.abspath(args.rs_root) if args.rs_root else None,
             "img_size": list(args.img_size),
             "fastdepth_input": list(FASTDEPTH_INPUT),
             "tta_hflip": args.tta_hflip,

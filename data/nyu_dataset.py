@@ -1,12 +1,14 @@
 """
-NYU Depth V2 dataset — three loading modes:
+NYU Depth V2 dataset — loading modes:
   1. 'hf'  : HuggingFace sayakpaul/nyu_depth_v2  (no local files needed)
   2. 'mat' : local nyu_depth_v2_labeled.mat       (depth already in metres)
   3. 'raw' : raw scene directories (.pgm/.ppm)    (full toolbox pipeline)
+  4. RealSenseAlignedPNG: ``depthData/runs/...`` with rgb/, depth/, meta.json
 """
 import os
 import re
 import io
+import json
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -25,6 +27,9 @@ from data.nyu_toolbox import (
 
 NYU_MEAN = [0.485, 0.456, 0.406]
 NYU_STD  = [0.229, 0.224, 0.225]
+
+# Intel RealSense D400-class devices typically use ~1 mm per uint16 depth unit.
+REALSENSE_DEFAULT_DEPTH_SCALE = 0.001
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -239,6 +244,191 @@ class NYUMatFile(Dataset):
             d = crop_image(d)                    # (427, 561)
         depth = _resize_depth(d, self.h, self.w).clamp(0, MAX_DEPTH)
         mask  = (depth > 0) & (depth <= MAX_DEPTH)
+        return {'image': image, 'depth': depth, 'mask': mask}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RealSense aligned captures (rgb/ + depth/ PNG folders, optional meta.json)
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_realsense_meta(root_dir: str) -> dict:
+    path = os.path.join(root_dir, "meta.json")
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _realsense_resolve_rgb_depth_dirs(
+    root_dir: str,
+    rgb_subdir: str | None = None,
+    depth_subdir: str | None = None,
+) -> tuple[str, str]:
+    """
+    Locate rgb and depth folders under a capture root.
+
+    Default names ``rgb/`` and ``depth/``; also accepts common variants
+    (case-insensitive): ``color``, ``Depth``, ``depth_raw``, etc.
+    Optional ``rgb_subdir`` / ``depth_subdir`` are path segments relative to
+    ``root_dir`` (e.g. ``images`` → ``root_dir/images``).
+    """
+    root = os.path.abspath(root_dir)
+    if not os.path.isdir(root):
+        raise FileNotFoundError(
+            f"RealSenseAlignedPNG: run folder does not exist or is not a directory: {root!r}"
+        )
+
+    child_dirs = [
+        name for name in os.listdir(root)
+        if os.path.isdir(os.path.join(root, name))
+    ]
+    lower_to_path = {name.lower(): os.path.join(root, name) for name in child_dirs}
+
+    rgb_candidates = ("rgb", "color", "colour", "images", "image")
+    depth_candidates = ("depth", "depth_raw", "depths", "depth_maps")
+
+    def pick(cands):
+        for c in cands:
+            if c in lower_to_path:
+                return lower_to_path[c]
+        return None
+
+    if rgb_subdir is not None:
+        rgb_path = os.path.join(root, rgb_subdir)
+        if not os.path.isdir(rgb_path):
+            raise FileNotFoundError(
+                f"RealSenseAlignedPNG: rgb folder {rgb_path!r} does not exist "
+                f"(check --rs-rgb-subdir)"
+            )
+    else:
+        rgb_path = pick(rgb_candidates)
+
+    if depth_subdir is not None:
+        depth_path = os.path.join(root, depth_subdir)
+        if not os.path.isdir(depth_path):
+            raise FileNotFoundError(
+                f"RealSenseAlignedPNG: depth folder {depth_path!r} does not exist "
+                f"(check --rs-depth-subdir)"
+            )
+    else:
+        depth_path = pick(depth_candidates)
+
+    if rgb_path is None or depth_path is None or not os.path.isdir(rgb_path) \
+            or not os.path.isdir(depth_path):
+        hint = (
+            "Expected a folder containing rgb/ and depth/ (or use "
+            "--rs-rgb-subdir / --rs-depth-subdir). "
+            "If you recorded with collect_data.py, set SAVE_DIR to this path or run "
+            "depthData/organize_run.py to move a capture into depthData/runs/<name>/."
+        )
+        listing = ", ".join(sorted(child_dirs)) if child_dirs else "(empty — no subfolders)"
+        raise FileNotFoundError(
+            f"RealSenseAlignedPNG: could not find rgb + depth image folders under {root!r}. "
+            f"Subfolders present: {listing}. {hint}"
+        )
+    return rgb_path, depth_path
+
+
+class RealSenseAlignedPNG(Dataset):
+    """
+    Loads paired RGB + uint16 depth PNGs from ``root_dir`` (aligned depth to color).
+
+    Layout::
+
+        root_dir/
+          meta.json          # optional; should contain depth_scale (metres per uint16 unit)
+          rgb/000000.png
+          depth/000000.png
+
+    ``meta.json`` from ``depthData/collect_data.py`` includes ``depth_scale`` and
+    ``color_space`` (``rgb`` for current script; older runs may be ``bgr_on_disk``
+    or missing — treated as OpenCV BGR-on-disk).
+
+    Args:
+        root_dir: Run folder (e.g. ``depthData/runs/my_run``).
+        img_size: Output (H, W) for tensors.
+        depth_scale: Metres per depth PNG unit; if None, read from ``meta.json``.
+        max_depth: Clip depth and mask upper bound (default matches NYU toolbox).
+        color_space: ``rgb`` | ``bgr_on_disk`` | None (infer from meta, else
+            ``bgr_on_disk`` for backward compatibility).
+        rgb_subdir: Optional subdirectory name for colour images (under ``root_dir``).
+        depth_subdir: Optional subdirectory name for depth PNGs (under ``root_dir``).
+    """
+
+    def __init__(self, root_dir: str, img_size=(320, 416),
+                 depth_scale: float | None = None,
+                 max_depth: float = MAX_DEPTH,
+                 color_space: str | None = None,
+                 rgb_subdir: str | None = None,
+                 depth_subdir: str | None = None):
+        self.root = os.path.abspath(root_dir)
+        self.rgb_dir, self.depth_dir = _realsense_resolve_rgb_depth_dirs(
+            self.root, rgb_subdir=rgb_subdir, depth_subdir=depth_subdir,
+        )
+
+        meta = _load_realsense_meta(self.root)
+        if depth_scale is None:
+            if "depth_scale" in meta:
+                depth_scale = float(meta["depth_scale"])
+            else:
+                depth_scale = REALSENSE_DEFAULT_DEPTH_SCALE
+                if meta:
+                    print(
+                        f"[RealSenseAlignedPNG] meta.json has no 'depth_scale'; "
+                        f"using default {depth_scale} m/unit (typical D400 RealSense). "
+                        f"Override with --rs-depth-scale if wrong."
+                    )
+                else:
+                    print(
+                        f"[RealSenseAlignedPNG] no meta.json under {self.root!r}; "
+                        f"using default depth_scale={depth_scale} m/unit. "
+                        f"Add meta.json or pass --rs-depth-scale for an accurate scale."
+                    )
+        self.depth_scale = depth_scale
+
+        if color_space is None:
+            color_space = meta.get("color_space", "bgr_on_disk")
+        self.color_space = color_space.lower()
+
+        self.tf = _img_transform(img_size)
+        self.h, self.w = img_size
+        self.max_depth = float(max_depth)
+
+        rgb_names = {f for f in os.listdir(self.rgb_dir)
+                     if f.lower().endswith((".png", ".jpg", ".jpeg"))}
+        depth_names = {f for f in os.listdir(self.depth_dir)
+                       if f.lower().endswith(".png")}
+        paired = sorted(rgb_names & depth_names)
+        if not paired:
+            raise FileNotFoundError(
+                f"RealSenseAlignedPNG: no matching PNG basenames between "
+                f"{self.rgb_dir!r} and {self.depth_dir!r}"
+            )
+        self._names = paired
+        print(f"RealSenseAlignedPNG: {len(self._names)} pairs | "
+              f"rgb={self.rgb_dir} | depth={self.depth_dir} | "
+              f"depth_scale={self.depth_scale} | color_space={self.color_space} | "
+              f"max_depth={self.max_depth}")
+
+    def __len__(self):
+        return len(self._names)
+
+    def __getitem__(self, idx):
+        name = self._names[idx]
+        rgb_path = os.path.join(self.rgb_dir, name)
+        depth_path = os.path.join(self.depth_dir, name)
+
+        rgb_np = np.array(Image.open(rgb_path).convert("RGB"), dtype=np.uint8)
+        # Legacy ``collect_data`` saved BGR arrays with cv2.imwrite; PNG "RGB"
+        # channels are then B,G,R — reverse to true RGB for the model.
+        if self.color_space != "rgb":
+            rgb_np = rgb_np[..., ::-1].copy()
+
+        depth_u16 = np.array(Image.open(depth_path), dtype=np.uint16)
+        depth_m = depth_u16.astype(np.float32) * self.depth_scale
+
+        image = self.tf(Image.fromarray(rgb_np))
+        depth = _resize_depth(depth_m, self.h, self.w).clamp(0, self.max_depth)
+        mask = (depth > 0) & (depth <= self.max_depth)
         return {'image': image, 'depth': depth, 'mask': mask}
 
 

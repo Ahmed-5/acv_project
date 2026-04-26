@@ -7,6 +7,7 @@ Metrics match the training loop in train_nyu.py (median scaling per image, valid
 Example:
   python eval_nyu.py --checkpoint checkpoints/dog_depth_nyu_v3.pth
   python eval_nyu.py --checkpoint ckpt.pth --mode mat --mat-path /path/to/nyu_depth_v2_labeled.mat
+  python eval_nyu.py --checkpoint ckpt.pth --mode realsense --rs-root depthData/runs/my_run
 """
 import argparse
 import json
@@ -23,6 +24,7 @@ from data.nyu_dataset import (
     NYUParquet,
     NYUDepthH5,
     NYURawScenes,
+    RealSenseAlignedPNG,
 )
 from models.dog_depth_net import DoGDepthNet
 
@@ -82,6 +84,18 @@ def build_val_loader(args):
         g = torch.Generator().manual_seed(args.raw_split_seed)
         _, val_ds = torch.utils.data.random_split(
             all_ds, [len(all_ds) - n_val, n_val], generator=g
+        )
+    elif mode == "realsense":
+        if not args.rs_root:
+            raise ValueError("--rs-root is required for mode=realsense")
+        val_ds = RealSenseAlignedPNG(
+            args.rs_root,
+            img_size,
+            depth_scale=args.rs_depth_scale,
+            max_depth=args.max_depth,
+            color_space=args.rs_color_space,
+            rgb_subdir=args.rs_rgb_subdir,
+            depth_subdir=args.rs_depth_subdir,
         )
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
@@ -218,7 +232,7 @@ def main():
         "--mode",
         type=str,
         default="h5",
-        choices=("h5", "mat", "parquet", "raw"),
+        choices=("h5", "mat", "parquet", "raw", "realsense"),
         help="Dataset layout (must match training preprocessing)",
     )
     p.add_argument("--img-size", type=parse_img_size, default="320,416", help="H,W or HxW (default matches train_nyu)")
@@ -251,6 +265,23 @@ def main():
     # raw
     p.add_argument("--raw-root", type=str, default=None)
     p.add_argument("--raw-split-seed", type=int, default=42, help="Generator seed for raw mode val subset")
+    # RealSense PNG capture (depthData/runs/... with rgb/, depth/, meta.json)
+    p.add_argument("--rs-root", type=str, default=None,
+                   help="Run folder for mode=realsense: the same path as SAVE_DIR in "
+                        "collect_data.py (must contain rgb/ and depth/, or use "
+                        "--rs-rgb-subdir / --rs-depth-subdir).")
+    p.add_argument("--rs-rgb-subdir", type=str, default=None,
+                   help="Optional subfolder name for colour images (default: auto-detect "
+                        "rgb, color, …).")
+    p.add_argument("--rs-depth-subdir", type=str, default=None,
+                   help="Optional subfolder for depth PNGs (default: auto-detect "
+                        "depth, depth_raw, …).")
+    p.add_argument("--rs-depth-scale", type=float, default=None,
+                   help="Override depth_scale (m per uint16 unit); default from meta.json.")
+    p.add_argument("--rs-color-space", type=str, default=None,
+                   choices=("rgb", "bgr_on_disk"),
+                   help="rgb = PNG is true RGB (current collect_data). "
+                        "bgr_on_disk = legacy OpenCV BGR save. Default: meta or bgr_on_disk.")
     p.add_argument("--json-out", type=str, default=None, help="Optional path to write metrics as JSON")
 
     args = p.parse_args()
@@ -314,6 +345,7 @@ def main():
             "checkpoint": os.path.abspath(args.checkpoint),
             "mode": args.mode,
             "img_size": list(args.img_size),
+            "rs_root": os.path.abspath(args.rs_root) if args.rs_root else None,
             "use_ema": args.use_ema,
             "tta_hflip": args.tta_hflip,
             "eigen_crop": args.eigen_crop,
